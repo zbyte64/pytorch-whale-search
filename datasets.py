@@ -1,13 +1,13 @@
 import torch
 import pandas as pd
+import torchvision
 from torchvision import transforms
 import os
 from PIL import Image
 
 
 BASIC_IMAGE_T = transforms.Compose([
-    transforms.Resize(128),
-    transforms.CenterCrop(128),
+    transforms.Resize((128, 128)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225])
@@ -59,20 +59,18 @@ class WhaleDataset(torch.utils.data.Dataset):
         op_id = r['Id']
         flipped = r['flipped']
         sample = [
-            self.process_image(op),
+            self.process_image(op, flipped),
             torch.tensor(self.class_to_index[op_id]),
             idx,
         ]
-        if flipped:
-            sample[0] = self.flip_image(sample[0])
         return tuple(sample)
 
-    def flip_image(self, x):
-        return torch.flip(x, [1, 2])
+    def read_image(self, image_id, flip):
+        img = Image.open(os.path.join(self.path, 'train', image_id)).convert("RGB")
+        if flip:
+            img = torchvision.transforms.functional.hflip(img)
+        return img
 
-    def read_image(self, image_id):
-        return Image.open(os.path.join(self.path, 'train', image_id)).convert("RGB")
-
-    def process_image(self, image_id):
-        im = self.read_image(image_id)
+    def process_image(self, image_id, flipped):
+        im = self.read_image(image_id, flipped)
         return self.image_t(im)

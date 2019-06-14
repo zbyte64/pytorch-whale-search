@@ -6,7 +6,6 @@ from torchvision.utils import save_image, make_grid
 
 from modules import VectorQuantizedVAE, to_scalar
 from datasets import WhaleDataset, BASIC_IMAGE_T
-from submodules import OpenAIAdam
 
 from tensorboardX import SummaryWriter
 
@@ -125,14 +124,13 @@ def main(args):
         batch_size=16, shuffle=True)
 
     # Fixed images for Tensorboard
-    fixed_images, _ = next(iter(test_loader))
+    fixed_images, _, _ = next(iter(test_loader))
     fixed_grid = make_grid(fixed_images, nrow=8, range=(-1, 1), normalize=True)
     writer.add_image('original', fixed_grid, 0)
 
     model = VectorQuantizedVAE(num_channels, args.hidden_size, args.k).to(args.device)
     epoch_size = args.num_epochs * len(train_loader)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    #optimizer = OpenAIAdam(model.parameters(), lr=args.lr, t_total=epoch_size, weight_decay=1e-5, schedule='warmup_cosine')
 
     # Generate the samples first once
     reconstruction = generate_samples(fixed_images, model, args)

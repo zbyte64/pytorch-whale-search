@@ -148,7 +148,7 @@ class CoordinateGenerator(nn.Module):
 
 
 class AffineCropper(nn.Module):
-    def __init__(self, dataloader, encoder):
+    def __init__(self, dataloader, input_dim, encoder):
         super(AffineCropper, self).__init__()
         self.dataloader = dataloader
         self.encoder = encoder
@@ -159,8 +159,9 @@ class AffineCropper(nn.Module):
         ]])
 
     def sample(self, idx, points_source):
-        image_id = self.dataloader._all_records.iloc[idx]['Image']
-        img = self.dataloader.read_image(image_id)
+        r = self.dataloader._all_records.iloc[idx]
+        image_id = r['Image']
+        img = self.dataloader.read_image(image_id, r['flipped'])
         points_source[1] *= img.shape[1]
         points_source[2] *= img.shape[2]
         M = kornia.get_perspective_transform(points_source, self.points_dest)
@@ -234,12 +235,7 @@ def main(args):
     writer = SummaryWriter('./logs/{0}'.format(args.output_folder))
     save_filename = './models/{0}'.format(args.output_folder)
 
-    if args.dataset in ['mnist', 'fashion-mnist', 'cifar10']:
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        ])
-    elif args.dataset == 'whales':
+    if args.dataset == 'whales':
         # Define the train, valid & test datasets
         all_dataset = WhaleDataset(args.data_folder, image_transformation=BASIC_IMAGE_T)
         from torch.utils.data import random_split
@@ -261,13 +257,13 @@ def main(args):
         batch_size=16, shuffle=True)
 
     # Fixed images for Tensorboard
-    fixed_images, _ = next(iter(test_loader))
+    fixed_images, _, _ = next(iter(test_loader))
     fixed_grid = make_grid(fixed_images, nrow=8, range=(-1, 1), normalize=True)
     writer.add_image('original', fixed_grid, 0)
 
-    #TODO model = torch.load(args.model_path).encoder
-    model = VectorQuantizedVAE(num_channels, args.hidden_size, args.k).encoder.to(args.device)
-    affine_resample = AffineCropper(args.data_folder, model)
+    encoder = torch.load(args.model_path).encoder.to(args.device)
+    affine_resample = AffineCropper(args.data_folder, args.hidden_size, encoder)
+    generator = affine_resample.generator
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # Generate the samples first once
@@ -277,8 +273,8 @@ def main(args):
 
     best_loss = -1.
     for epoch in range(args.num_epochs):
-        train(train_loader, model, affine_resample, optimizer, args, writer)
-        loss = test(valid_loader, model, affine_resample, args, writer)
+        train(train_loader, encoder, affine_resample, optimizer, args, writer)
+        loss = test(valid_loader, encoder, affine_resample, args, writer)
 
         reconstruction = generate_samples(fixed_images, affine_resample, args)
         grid = make_grid(reconstruction.cpu(), nrow=8, range=(-1, 1), normalize=True)
@@ -287,9 +283,9 @@ def main(args):
         if (epoch == 0) or (loss < best_loss):
             best_loss = loss
             with open('{0}/best.pt'.format(save_filename), 'wb') as f:
-                torch.save(model.state_dict(), f)
+                torch.save(generator.state_dict(), f)
         with open('{0}/model_{1}.pt'.format(save_filename, epoch + 1), 'wb') as f:
-            torch.save(model.state_dict(), f)
+            torch.save(generator.state_dict(), f)
 
 if __name__ == '__main__':
     import argparse
@@ -311,8 +307,6 @@ if __name__ == '__main__':
     # Latent space
     parser.add_argument('--hidden-size', type=int, default=256,
         help='size of the latent vectors (default: 256)')
-    parser.add_argument('--k', type=int, default=512,
-        help='number of latent vectors (default: 512)')
 
     # Optimization
     parser.add_argument('--batch-size', type=int, default=128,
@@ -325,8 +319,8 @@ if __name__ == '__main__':
         help='contribution of commitment loss, between 0.1 and 2.0 (default: 1.0)')
 
     # Miscellaneous
-    parser.add_argument('--output-folder', type=str, default='vqvae',
-        help='name of the output folder (default: vqvae)')
+    parser.add_argument('--output-folder', type=str, default='aspect_transfer',
+        help='name of the output folder (default: aspect_transfer)')
     parser.add_argument('--num-workers', type=int, default=mp.cpu_count() - 1,
         help='number of workers for trajectories sampling (default: {0})'.format(mp.cpu_count() - 1))
     parser.add_argument('--device', type=str, default='cpu',
