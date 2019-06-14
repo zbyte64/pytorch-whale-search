@@ -46,10 +46,10 @@ class WhaleDataset(torch.utils.data.Dataset):
         self._negative_records = df[list(~anchor_index)]
         self.image_t = image_transformation
         self._label_encoder = self.class_to_index
-    
+
     def __len__(self):
         return len(self._records)
-    
+
     def __getitem__(self, idr):
         if isinstance(idr, torch.Tensor):
             idr = idr.item()
@@ -61,15 +61,18 @@ class WhaleDataset(torch.utils.data.Dataset):
         sample = [
             self.process_image(op),
             torch.tensor(self.class_to_index[op_id]),
+            idx,
         ]
         if flipped:
             sample[0] = self.flip_image(sample[0])
         return tuple(sample)
-    
+
     def flip_image(self, x):
         return torch.flip(x, [1, 2])
-    
-    def process_image(self, image_id):
-        im = Image.open(os.path.join(self.path, 'train', image_id)).convert("RGB")
-        return self.image_t(im)
 
+    def read_image(self, image_id):
+        return Image.open(os.path.join(self.path, 'train', image_id)).convert("RGB")
+
+    def process_image(self, image_id):
+        im = self.read_image(image_id)
+        return self.image_t(im)
