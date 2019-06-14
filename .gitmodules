@@ -1,0 +1,6 @@
+[submodule "pytorch-vqvae"]
+	path = pytorch-vqvae
+	url = https://github.com/ritheshkumar95/pytorch-vqvae.git
+[submodule "semantic-segmentation-pytorch"]
+	path = semantic-segmentation-pytorch
+	url = git@github.com:CSAILVision/semantic-segmentation-pytorch.git
