@@ -1,11 +1,14 @@
+import torch
 from torch import nn
 from torch.nn import functional as F
 import numpy as np
+import torchvision
 from torchvision import transforms, datasets
 from torchvision.utils import save_image, make_grid
+import kornia
 
 from modules import VectorQuantizedVAE, to_scalar, ResBlock
-from dataset import WhaleDataset, BASIC_IMAGE_T
+from datasets import WhaleDataset, BASIC_IMAGE_T
 
 from tensorboardX import SummaryWriter
 
@@ -128,23 +131,26 @@ class CoordinateGenerator(nn.Module):
     def __init__(self, input_dim):
         super(CoordinateGenerator, self).__init__()
         self.encoder = nn.Sequential(
-            nn.Conv2d(input_dim, 8, 2, 1, 1),
+            nn.Conv2d(input_dim, 8, 3, 1, 1),
             nn.BatchNorm2d(8),
             nn.ReLU(True),
-            nn.Conv2d(8, 4, 2, 1, 1),
+            nn.Conv2d(8, 4, 3, 1, 1),
         )
-        self._index_range = torch.arange(0, 16)
+        self._lsize = 32.
+        self._index_range = torch.arange(0., self._lsize)
 
     def forward(self, x):
         # (-1, dim, 16, 16)
         coords_vote = self.encoder(x)
-        assert coords_vote.shape == [x.shape[0], 4, 16, 16]
+        #assert coords_vote.shape == [x.shape[0], 4, self._lsize, self._lsize], '%s | %s' % (coords_vote.shape, x.shape)
         _p = lambda v, dim: F.softmax(v.sum(dim=dim), dim=2)
         x_votes = _p(coords_vote, dim=2)
         y_votes = _p(coords_vote, dim=3)
-        x_coord = x_votes * self._index_range / 16
-        y_coord = y_votes * self._index_range / 16
-        return torch.cat([x_coord, y_coord], dim=1)
+        x_coord = torch.sum(x_votes * self._index_range / self._lsize, 2, keepdim=True)
+        y_coord = torch.sum(y_votes * self._index_range / self._lsize, 2, keepdim=True)
+        c = torch.cat([x_coord, y_coord], dim=2)
+        #assert c.shape[1:] == [4, 2], str(c.shape)
+        return c
 
 
 class AffineCropper(nn.Module):
@@ -162,10 +168,11 @@ class AffineCropper(nn.Module):
         r = self.dataloader._all_records.iloc[idx]
         image_id = r['Image']
         img = self.dataloader.read_image(image_id, r['flipped'])
+        img = torchvision.transforms.functional.to_tensor(img)
         points_source[1] *= img.shape[1]
         points_source[2] *= img.shape[2]
-        M = kornia.get_perspective_transform(points_source, self.points_dest)
-        return kornia.warp_perspective(img, M, dsize=(self.h, self.w))
+        M = kornia.get_perspective_transform(points_source.unsqueeze(0), self.points_dest)
+        return kornia.warp_perspective(img.unsqueeze(0), M, dsize=(self.h, self.w))[0]
 
     def forward(self, x, idxs):
         with torch.no_grad():
@@ -173,16 +180,16 @@ class AffineCropper(nn.Module):
         aspect_coords = self.generator(latent).clamp(0, 1)
 
         cropped_images = []
-        for i in range(idx.shape[0]):
-            idx = idxs[i]
-            img_result = affine_resample.sample(idx, aspect_coords[i])
+        for i in range(idxs.shape[0]):
+            idx = idxs[i].item()
+            img_result = self.sample(idx, aspect_coords[i])
             cropped_images.append(img_result)
         cropped_images = torch.cat(cropped_images, dim=0)
         return cropped_images
 
 
 def train(data_loader, model, affine_resample, optimizer, args, writer):
-    style_img = content_img = data_loader.process_image(args.target_image)
+    style_img = content_img = data_loader.process_image(args.target_image, flip=False)
     style_transfer_model, get_loss = get_style_model_and_losses(model,
         style_img, content_img)
     style_transfer_model.to(args.device)
@@ -205,7 +212,7 @@ def train(data_loader, model, affine_resample, optimizer, args, writer):
 
 
 def test(data_loader, model, affine_resample, args, writer):
-    style_img = content_img = data_loader.process_image(args.target_image)
+    style_img = content_img = data_loader.process_image(args.target_image, flip=False)
     style_transfer_model, get_loss = get_style_model_and_losses(model,
         style_img, content_img)
     with torch.no_grad():
@@ -224,10 +231,11 @@ def test(data_loader, model, affine_resample, args, writer):
 
     return loss.item()
 
-def generate_samples(images, model, args):
+def generate_samples(images, fixed_ids, model, args):
     with torch.no_grad():
         images = images.to(args.device)
-        x_tilde = model(images)
+        fixed_ids = fixed_ids.to(args.device)
+        x_tilde = model(images, fixed_ids)
     return x_tilde
 
 
@@ -257,17 +265,19 @@ def main(args):
         batch_size=16, shuffle=True)
 
     # Fixed images for Tensorboard
-    fixed_images, _, _ = next(iter(test_loader))
+    fixed_images, _, fixed_ids = next(iter(test_loader))
     fixed_grid = make_grid(fixed_images, nrow=8, range=(-1, 1), normalize=True)
     writer.add_image('original', fixed_grid, 0)
 
-    encoder = torch.load(args.model_path).encoder.to(args.device)
-    affine_resample = AffineCropper(args.data_folder, args.hidden_size, encoder)
+    vae = VectorQuantizedVAE(num_channels, args.hidden_size, args.k)
+    vae.load_state_dict(torch.load(args.model_path))
+    encoder = vae.encoder.eval().to(args.device)
+    affine_resample = AffineCropper(all_dataset, args.hidden_size, encoder)
     generator = affine_resample.generator
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(generator.parameters(), lr=args.lr)
 
     # Generate the samples first once
-    reconstruction = generate_samples(fixed_images, model, args)
+    reconstruction = generate_samples(fixed_images, fixed_ids, affine_resample, args)
     grid = make_grid(reconstruction.cpu(), nrow=8, range=(-1, 1), normalize=True)
     writer.add_image('reconstruction', grid, 0)
 
@@ -276,7 +286,7 @@ def main(args):
         train(train_loader, encoder, affine_resample, optimizer, args, writer)
         loss = test(valid_loader, encoder, affine_resample, args, writer)
 
-        reconstruction = generate_samples(fixed_images, affine_resample, args)
+        reconstruction = generate_samples(fixed_images, fixed_ids, affine_resample, args)
         grid = make_grid(reconstruction.cpu(), nrow=8, range=(-1, 1), normalize=True)
         writer.add_image('cropped', grid, epoch + 1)
 
@@ -301,13 +311,15 @@ if __name__ == '__main__':
         help='name of the dataset (mnist, fashion-mnist, cifar10, miniimagenet)')
     parser.add_argument('--model-path', type=str,
         help='path to trained autoencoder')
-    parser.add_argument('--target-image', type=str,
-        help='path to target image')
+    parser.add_argument('--target-image', type=str, default='579d08953.jpg',
+        help='target image (579d08953.jpg)')
 
     # Latent space
     parser.add_argument('--hidden-size', type=int, default=256,
         help='size of the latent vectors (default: 256)')
-
+    parser.add_argument('--k', type=int, default=512,
+        help='number of latent vectors (default: 512)')
+    
     # Optimization
     parser.add_argument('--batch-size', type=int, default=128,
         help='batch size (default: 128)')
@@ -315,9 +327,7 @@ if __name__ == '__main__':
         help='number of epochs (default: 100)')
     parser.add_argument('--lr', type=float, default=2e-4,
         help='learning rate for Adam optimizer (default: 2e-4)')
-    parser.add_argument('--beta', type=float, default=1.0,
-        help='contribution of commitment loss, between 0.1 and 2.0 (default: 1.0)')
-
+    
     # Miscellaneous
     parser.add_argument('--output-folder', type=str, default='aspect_transfer',
         help='name of the output folder (default: aspect_transfer)')
