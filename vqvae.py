@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from torchvision import transforms, datasets
 from torchvision.utils import save_image, make_grid
+import kornia
 
 from modules import VectorQuantizedVAE, to_scalar
 from datasets import WhaleDataset, BASIC_IMAGE_T
@@ -18,12 +19,13 @@ def train(data_loader, model, optimizer, args, writer):
 
         # Reconstruction loss
         loss_recons = F.mse_loss(x_tilde, images)
+        loss_ssim = kornia.losses.ssim(x_tilde, images, 5, 'mean')
         # Vector quantization objective
         loss_vq = F.mse_loss(z_q_x, z_e_x.detach())
         # Commitment objective
         loss_commit = F.mse_loss(z_e_x, z_q_x.detach())
 
-        loss = loss_recons + loss_vq + args.beta * loss_commit
+        loss = (loss_ssim + loss_recons)/2 + loss_vq + args.beta * loss_commit
         loss.backward()
 
         # Logs

@@ -120,7 +120,7 @@ class VectorQuantizedVAE(nn.Module):
         )
 
         self.codebook = VQEmbedding(K, dim)
-
+        
         self.decoder = nn.Sequential(
             ResBlock(dim),
             ResBlock(dim),
@@ -129,7 +129,7 @@ class VectorQuantizedVAE(nn.Module):
             nn.BatchNorm2d(dim),
             nn.ReLU(True),
             nn.ConvTranspose2d(dim, input_dim, 4, 2, 1),
-            nn.Tanh()
+            nn.Tanh(),
         )
 
         self.apply(weights_init)
@@ -149,6 +149,40 @@ class VectorQuantizedVAE(nn.Module):
         z_q_x_st, z_q_x = self.codebook.straight_through(z_e_x)
         x_tilde = self.decoder(z_q_x_st)
         return x_tilde, z_e_x, z_q_x
+
+
+class LargeVectorQuantizedVAE(VectorQuantizedVAE):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        e_stack = lambda i,o: [
+            nn.Conv2d(i, o, 4, 2, 1),
+            nn.BatchNorm2d(o),
+            nn.ReLU(True),
+            nn.Conv2d(o, o, 4, 2, 1),
+            ResBlock(o),
+        ]
+        self.encoder = nn.Sequential(
+            *e_stack(input_dim, dim // 8),
+            #*e_stack(dim // 8, dim // 4),
+            *e_stack(dim // 8, dim),
+            ResBlock(dim),
+        )
+        
+        d_stack = lambda i,o: [
+            ResBlock(i),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(i, i, 4, 2, 1),
+            nn.BatchNorm2d(i),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(i, o, 4, 2, 1),
+        ]
+        
+        self.decoder = nn.Sequential(
+            *d_stack(dim, dim // 8),
+            #*d_stack(dim // 4, dim // 8),
+            *d_stack(dim // 8, input_dim),
+            nn.Tanh(),
+        )
 
 
 class GatedActivation(nn.Module):

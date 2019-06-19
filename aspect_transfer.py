@@ -6,12 +6,16 @@ import torchvision
 from torchvision import transforms, datasets
 from torchvision.utils import save_image, make_grid
 import kornia
+import copy
 
 from modules import VectorQuantizedVAE, to_scalar, ResBlock
 from datasets import WhaleDataset, BASIC_IMAGE_T
 
 from tensorboardX import SummaryWriter
 
+
+if not hasattr(torch, 'solve'):
+    torch.solve = torch.gesv
 
 class ContentLoss(nn.Module):
     def __init__(self, target,):
@@ -23,7 +27,7 @@ class ContentLoss(nn.Module):
         self.target = target.detach()
 
     def forward(self, input):
-        self.loss = F.mse_loss(input, self.target)
+        self.loss = F.mse_loss(input.mean(0), self.target)
         return input
 
 
@@ -31,7 +35,12 @@ def gram_matrix(input):
     a, b, c, d = input.size()  # a=batch size(=1)
     # b=number of feature maps
     # (c,d)=dimensions of a f. map (N=c*d)
-
+    features = input.view(a, b, c*d).clone()
+    features_t = features.transpose(1, 2).clone()
+    k = b*c*d
+    G = torch.bmm(features, features_t) / (k)
+    return G 
+    
     features = input.view(a * b, c * d)  # resise F_XL into \hat F_XL
 
     G = torch.mm(features, features.t())  # compute the gram product
@@ -59,7 +68,10 @@ style_layers_default = ['conv_1', 'conv_2', 'res_3', 'res_4']
 def get_style_model_and_losses(cnn, style_img, content_img,
                                content_layers=content_layers_default,
                                style_layers=style_layers_default):
-    cnn = copy.deepcopy(cnn)
+    _device = style_img.device
+    cnn = copy.deepcopy(cnn).to(_device)
+    style_img = style_img.unsqueeze(0)
+    content_img = content_img.unsqueeze(0)
 
     # just in order to have an iterable access to or list of content/syle
     # losses
@@ -68,7 +80,7 @@ def get_style_model_and_losses(cnn, style_img, content_img,
 
     # assuming that cnn is a nn.Sequential, so we make a new nn.Sequential
     # to put in modules that are supposed to be activated sequentially
-    model = nn.Sequential()
+    model = nn.Sequential().to(_device)
 
     i = 0  # increment every time we see a conv
     for layer in cnn.children():
@@ -115,13 +127,11 @@ def get_style_model_and_losses(cnn, style_img, content_img,
     model = model[:(i + 1)]
 
     def compute_loss():
-        style_score = 0
-        content_score = 0
-
-        for sl in style_losses:
-            style_score += sl.loss
-        for cl in content_losses:
-            content_score += cl.loss
+        style_score = content_score = torch.tensor(0., device=_device)
+        if style_losses:
+            style_score = torch.stack([l.loss for l in style_losses]).sum()
+        if content_losses:
+            content_score = torch.stack([l.loss for l in content_losses]).sum()
         return style_score + content_score
 
     return model, compute_loss
@@ -136,20 +146,23 @@ class CoordinateGenerator(nn.Module):
             nn.ReLU(True),
             nn.Conv2d(8, 4, 3, 1, 1),
         )
-        self._lsize = 32.
-        self._index_range = torch.arange(0., self._lsize)
+        self.fn = nn.Sequential(
+            nn.Linear(4 * 32 * 32, 4),
+            nn.Sigmoid(),
+        )
 
     def forward(self, x):
         # (-1, dim, 16, 16)
-        coords_vote = self.encoder(x)
-        #assert coords_vote.shape == [x.shape[0], 4, self._lsize, self._lsize], '%s | %s' % (coords_vote.shape, x.shape)
-        _p = lambda v, dim: F.softmax(v.sum(dim=dim), dim=2)
-        x_votes = _p(coords_vote, dim=2)
-        y_votes = _p(coords_vote, dim=3)
-        x_coord = torch.sum(x_votes * self._index_range / self._lsize, 2, keepdim=True)
-        y_coord = torch.sum(y_votes * self._index_range / self._lsize, 2, keepdim=True)
-        c = torch.cat([x_coord, y_coord], dim=2)
-        #assert c.shape[1:] == [4, 2], str(c.shape)
+        r = self.encoder(x).view(x.shape[0], -1)
+        r = self.fn(r)
+        cx, cy, w, h = r[:,0], r[:,1], r[:,2], r[:,3]
+        x1, x2, y1, y2 = cx - w, cx + w, cy - h, cy + h
+        c = torch.stack([
+            torch.stack([x1, y1], 1),
+            torch.stack([x2, y1], 1),
+            torch.stack([x2, y2], 1),
+            torch.stack([x1, y2], 1),
+        ], 1).clamp(0, 1)
         return c
 
 
@@ -167,29 +180,30 @@ class AffineCropper(nn.Module):
     def sample(self, idx, points_source):
         r = self.dataloader._all_records.iloc[idx]
         image_id = r['Image']
+        _device = points_source.device
         img = self.dataloader.read_image(image_id, r['flipped'])
-        img = torchvision.transforms.functional.to_tensor(img)
-        points_source[1] *= img.shape[1]
-        points_source[2] *= img.shape[2]
-        M = kornia.get_perspective_transform(points_source.unsqueeze(0), self.points_dest)
+        img = torchvision.transforms.functional.to_tensor(img).to(_device)
+        px = points_source[:,0] * img.shape[1]
+        py = points_source[:,1] * img.shape[2]
+        p = torch.stack([px, py], dim=1)
+        M = kornia.get_perspective_transform(p.unsqueeze(0), self.points_dest.to(_device))
         return kornia.warp_perspective(img.unsqueeze(0), M, dsize=(self.h, self.w))[0]
 
     def forward(self, x, idxs):
-        with torch.no_grad():
-            latent = self.encoder(x)
+        latent = self.encoder(x)
         aspect_coords = self.generator(latent).clamp(0, 1)
 
         cropped_images = []
         for i in range(idxs.shape[0]):
             idx = idxs[i].item()
-            img_result = self.sample(idx, aspect_coords[i])
+            img_result = self.sample(idx, aspect_coords[i]).to(x.device)
             cropped_images.append(img_result)
-        cropped_images = torch.cat(cropped_images, dim=0)
+        cropped_images = torch.stack(cropped_images, dim=0)
         return cropped_images
 
 
 def train(data_loader, model, affine_resample, optimizer, args, writer):
-    style_img = content_img = data_loader.process_image(args.target_image, flip=False)
+    style_img = content_img = affine_resample.dataloader.process_image(args.target_image, flip=False).to(args.device)
     style_transfer_model, get_loss = get_style_model_and_losses(model,
         style_img, content_img)
     style_transfer_model.to(args.device)
@@ -212,7 +226,7 @@ def train(data_loader, model, affine_resample, optimizer, args, writer):
 
 
 def test(data_loader, model, affine_resample, args, writer):
-    style_img = content_img = data_loader.process_image(args.target_image, flip=False)
+    style_img = content_img = affine_resample.dataloader.process_image(args.target_image, flip=False).to(args.device)
     style_transfer_model, get_loss = get_style_model_and_losses(model,
         style_img, content_img)
     with torch.no_grad():
@@ -272,18 +286,19 @@ def main(args):
     vae = VectorQuantizedVAE(num_channels, args.hidden_size, args.k)
     vae.load_state_dict(torch.load(args.model_path))
     encoder = vae.encoder.eval().to(args.device)
-    affine_resample = AffineCropper(all_dataset, args.hidden_size, encoder)
-    generator = affine_resample.generator
+    affine_resample = AffineCropper(all_dataset, args.hidden_size, encoder).to(args.device)
+    generator = affine_resample.generator.train()
     optimizer = torch.optim.Adam(generator.parameters(), lr=args.lr)
 
     # Generate the samples first once
     reconstruction = generate_samples(fixed_images, fixed_ids, affine_resample, args)
     grid = make_grid(reconstruction.cpu(), nrow=8, range=(-1, 1), normalize=True)
-    writer.add_image('reconstruction', grid, 0)
+    writer.add_image('cropped', grid, 0)
 
     best_loss = -1.
     for epoch in range(args.num_epochs):
-        train(train_loader, encoder, affine_resample, optimizer, args, writer)
+        with torch.autograd.set_detect_anomaly(True):
+            train(train_loader, encoder, affine_resample, optimizer, args, writer)
         loss = test(valid_loader, encoder, affine_resample, args, writer)
 
         reconstruction = generate_samples(fixed_images, fixed_ids, affine_resample, args)
