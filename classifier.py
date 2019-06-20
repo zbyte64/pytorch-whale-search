@@ -8,30 +8,10 @@ from torchvision.utils import save_image, make_grid
 import kornia
 import copy
 
-from modules import VectorQuantizedVAE, to_scalar, ResBlock
-from datasets import TripletWhaleDataset, WhaleDataset, BASIC_IMAGE_T
+from modules import VectorQuantizedVAE, to_scalar, ResBlock, Lambda
+from datasets import TripletWhaleDataset, WhaleDataset, BASIC_IMAGE_T, FINALIZE_T, AUG_IMAGE_T
 
 from tensorboardX import SummaryWriter
-
-
-class RegionProposalNetwork(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_dim, 8, 3, 1, 1),
-            nn.BatchNorm2d(8),
-            nn.ReLU(True),
-            nn.Conv2d(8, 4, 3, 1, 1),
-        )
-        self.fn = nn.Sequential(
-            nn.Linear(4 * 32 * 32, 4),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x):
-        # (-1, dim, 16, 16)
-        r = self.encoder(x).view(x.shape[0], -1)
-        return self.fn(r)
 
 
 class AffineClassifier(nn.Module):
@@ -41,24 +21,38 @@ class AffineClassifier(nn.Module):
         self._transfer_ = {
             'encoder': encoder
         }
-        self.region_proposals = RegionProposalNetwork(256)
+        self.region_proposals = nn.Sequential(
+            nn.Conv2d(256, 64, 4, 1, 1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            nn.Conv2d(64, 16, 7, 1, 1),
+            ResBlock(16),
+            ResBlock(16),
+            nn.MaxPool2d(32),
+            Lambda(lambda x: x.view(x.shape[0], 16)),
+            nn.Linear(16, 4),
+            nn.Sigmoid(),
+        )
         self.h, self.w = 128, 128
         self.points_dest = torch.FloatTensor([[
             [0, 0], [self.w - 1, 0], [self.w - 1, self.h - 1], [0, self.h - 1],
         ]])
         self.conv_classifier = nn.Sequential(
-            nn.Conv2d(256, 8, 3, 1, 1),
-            nn.BatchNorm2d(8),
+            nn.Conv2d(256, 128, 4, 1, 1),
+            nn.BatchNorm2d(128),
             nn.ReLU(True),
-            nn.Conv2d(8, 4, 3, 1, 1),
+            nn.Conv2d(128, 64, 7, 1, 1),
+            ResBlock(64),
+            ResBlock(64),
+            nn.MaxPool2d(32)
         )
         self.fn = nn.Sequential(
-            nn.Linear(4 * 32 * 32, output_dim),
+            nn.Linear(64, output_dim),
         )
 
     def forward(self, x, idx):
         px = self._transfer_['encoder'](x)
-        rp = self.region_proposals(px)
+        rp = self.region_proposals(px).view(x.shape[0], -1)
         py = self.conv_classifier(px).view(x.shape[0], -1)
         p = self.fn(py)
         
@@ -76,35 +70,36 @@ class AffineClassifier(nn.Module):
         return c, l, resamples
     
     def resample_record(self, idx, p):
+        from PIL import ImageOps
         r = self.dataloader._all_records.iloc[idx]
         image_id = r['Image']
         img = self.dataloader.read_image(image_id, r['flipped'])
-        iw,ih = img.size
-        img = transforms.functional.to_tensor(img).to(p.device)
-        img = transforms.functional.normalize(img, 
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225])
-        px = p[0:2] * iw
-        py = p[2:4] * ih
-        w = px[1].clamp(self.w//2, iw//2)
-        h = py[1].clamp(self.h//2, ih//2)
-        cx = px[0].clamp(self.w//2, iw-self.w//2)
-        cy = py[0].clamp(self.h//2, ih-self.h//2)
+        img = AUG_IMAGE_T(image=img)['image']
+        img = FINALIZE_T(image=img)['image'].to(p.device)
+        ih,iw = img.shape[1:]
+        hiw,hih = iw // 2, ih // 2
+        hsw,hsh = self.w // 2, self.h // 2
+        rclamp = lambda x, _min, _max: x * (_max-_min) + _min
+        w = rclamp(p[0], hsw, hiw)
+        h = rclamp(p[1], hsh, hih)
+        cx = rclamp(p[2], hsw, iw-hsw)
+        cy = rclamp(p[3], hsh, ih-hsh)
         x1 = (cx - w).clamp(0, iw)
         x2 = (cx + w).clamp(0, iw)
         y1 = (cy - h).clamp(0, ih)
         y2 = (cy + h).clamp(0, ih)
         # compute perspective transform
         points_src = torch.stack([
-            torch.stack([x1, y1]),
-            torch.stack([x2, y1]),
-            torch.stack([x2, y2]),
-            torch.stack([x1, y2]),
+            torch.stack([y1, x1]),
+            torch.stack([y1, x2]),
+            torch.stack([y2, x1]),
+            torch.stack([y2, x2]),
         ]).unsqueeze(0)
-        M = kornia.get_perspective_transform(points_src, self.points_dest.to(p.device))
+        img_warp = kornia.crop_and_resize(img.unsqueeze(0), points_src, (self.h, self.w))
+        #M = kornia.get_perspective_transform(points_src, self.points_dest.to(p.device))
 
         # warp the original image by the found transform
-        img_warp = kornia.warp_perspective(img.unsqueeze(0), M, dsize=(self.h, self.w))
+        #img_warp = kornia.warp_perspective(img.unsqueeze(0), M, dsize=(self.h, self.w))
         return img_warp.squeeze(0)
 
 
@@ -119,7 +114,10 @@ def train(data_loader, model, optimizer, args, writer):
         _, b, _ = model(pimages, pidx)
         _, c, _ = model(nimages, nidx)
         loss_margin = F.triplet_margin_loss(a,b,c, margin=.3, swap=True)
-        loss_class = F.cross_entropy(p_labels, labels)
+        #loss_class = F.cross_entropy(p_labels, labels)
+        bs = labels.shape[0]
+        k = p_labels.shape[1]
+        loss_class = kornia.losses.focal_loss(p_labels.view(bs, k, 1, 1).cpu(), labels.view(bs, 1, 1).cpu(), .5).to(args.device).mean()
         loss = loss_margin * 10 + loss_class
         loss.backward()
 
@@ -133,6 +131,8 @@ def train(data_loader, model, optimizer, args, writer):
 def test(data_loader, model, args, writer):
     with torch.no_grad():
         loss = 0.
+        correct = 0.
+        count = 0
         for (images, labels, idx,
              pimages, plabels, pidx,
              nimages, nlabels, nidx) in data_loader:
@@ -142,9 +142,13 @@ def test(data_loader, model, args, writer):
             p_labels, _, rimages = model(images, idx)
 
             loss += F.cross_entropy(p_labels, labels)
+            correct += torch.sum(p_labels.argmax() == labels)
+            count += images.shape[0]
         loss  /= len(data_loader)
+        acc = correct * 100 / count
 
     # Logs
+    writer.add_scalar('accuracy/test', acc.item(), args.steps)
     writer.add_scalar('loss/test', loss.item(), args.steps)
     grid = make_grid(rimages.cpu(), nrow=8, range=(-1, 1), normalize=True)
     writer.add_image('resample', grid, args.steps)
@@ -180,7 +184,7 @@ def main(args):
     fixed_images, _, fixed_ids = next(iter(test_loader))[:3]
     fixed_grid = make_grid(fixed_images, nrow=8, range=(-1, 1), normalize=True)
     writer.add_image('original', fixed_grid, 0)
-    n_classes = len(all_dataset._label_encoder)
+    n_classes = len(all_dataset.index_to_class)
 
     vae = VectorQuantizedVAE(num_channels, args.hidden_size, args.k)
     vae.load_state_dict(torch.load(args.model_path))

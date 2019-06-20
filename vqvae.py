@@ -15,7 +15,7 @@ def train(data_loader, model, optimizer, args, writer):
         images = images.to(args.device)
 
         optimizer.zero_grad()
-        x_tilde, z_e_x, z_q_x = model(images)
+        x_tilde, z_e_x, z_q_x = model(F.dropout2d(images), p=0.25)
 
         # Reconstruction loss
         loss_recons = F.mse_loss(x_tilde, images)

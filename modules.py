@@ -22,6 +22,14 @@ def weights_init(m):
         except AttributeError:
             print("Skipping initialization of ", classname)
 
+class Lambda(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+    
+    def forward(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
+
 
 class VAE(nn.Module):
     def __init__(self, input_dim, dim, z_dim):
@@ -92,11 +100,11 @@ class VQEmbedding(nn.Module):
 
 
 class ResBlock(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, k=3):
         super().__init__()
         self.block = nn.Sequential(
             nn.ReLU(True),
-            nn.Conv2d(dim, dim, 3, 1, 1),
+            nn.Conv2d(dim, dim, k, 1, 1),
             nn.BatchNorm2d(dim),
             nn.ReLU(True),
             nn.Conv2d(dim, dim, 1),

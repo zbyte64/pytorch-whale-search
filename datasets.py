@@ -6,26 +6,43 @@ from torchvision import transforms
 import os
 import random
 from PIL import Image, ImageOps
+import albumentations
+from albumentations.pytorch import ToTensor
+import numpy as np
 
 
-BASIC_IMAGE_T = transforms.Compose([
-    transforms.Lambda(ImageOps.autocontrast),
-    transforms.Resize((128, 128)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
+FINALIZE_T = albumentations.Compose([
+    albumentations.Normalize(mean=[0.485, 0.456, 0.406],
+                     std=[0.229, 0.224, 0.225]),
+    ToTensor(),
 ])
 
-TRAIN_IMAGE_T = transforms.Compose([
-    #transforms.Lambda(ImageOps.autocontrast),
-    transforms.Resize((128, 128)),
-    #transforms.RandomAffine(degrees=360, shear=11),
-    #transforms.RandomResizedCrop(128, scale=(.9, 1.1)),
-    transforms.ColorJitter(brightness=0.11, contrast=0.11, saturation=0.11, hue=0.11),
-    transforms.RandomGrayscale(.5),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
+BASIC_IMAGE_T = albumentations.Compose([
+    albumentations.Resize(128, 128),
+    FINALIZE_T
+])
+
+AUG_IMAGE_T = albumentations.Compose([
+    albumentations.GaussNoise(),
+    albumentations.OneOf([
+        albumentations.MotionBlur(),
+        albumentations.MedianBlur(blur_limit=3),
+        albumentations.Blur(blur_limit=3),
+        albumentations.JpegCompression(quality_lower=90),
+    ]),
+    albumentations.OneOf([
+        albumentations.CLAHE(clip_limit=2),
+        albumentations.IAASharpen(),
+        albumentations.RandomBrightnessContrast(),
+    ]),
+    albumentations.HueSaturationValue(p=0.3),
+])
+
+
+TRAIN_IMAGE_T = albumentations.Compose([
+    albumentations.Resize(128, 128),
+    AUG_IMAGE_T,
+    FINALIZE_T
 ])
 
     
@@ -44,18 +61,17 @@ class WhaleDataset(torch.utils.data.Dataset):
         self._all_records = df
         grouping = self._all_records.groupby(['Id'])
         self._by_class = grouping.groups
-        self.index_to_class = list(self._by_class.keys())
-        self.index_to_class.sort()
-        self.class_to_index = {k:i for i,k in enumerate(self.index_to_class)}
         anchor = grouping['Image'].count() >= min_instance_count
         anchor['new_whale'] = False
         if include_flips:
             anchor['flipped_new_whale'] = False
         anchor_index = anchor[df.Id]
+        self.index_to_class = list(map(lambda i:i[0], filter(lambda i:i[1], anchor.items())))
+        self.index_to_class.sort()
+        self.class_to_index = {k:i for i,k in enumerate(self.index_to_class)}
         self._records = df[list(anchor_index)]
         self._negative_records = df[list(~anchor_index)]
         self.image_t = image_transformation
-        self._label_encoder = self.class_to_index
 
     def __len__(self):
         return len(self._records)
@@ -80,12 +96,12 @@ class WhaleDataset(torch.utils.data.Dataset):
     def read_image(self, image_id, flip):
         img = Image.open(os.path.join(self.path, 'train', image_id)).convert("RGB")
         if flip:
-            img = torchvision.transforms.functional.hflip(img)
-        return img
+            img = transforms.functional.hflip(img)
+        return np.array(img)
 
     def process_image(self, image_id, flip):
         im = self.read_image(image_id, flip)
-        return self.image_t(im)
+        return self.image_t(image=im)['image']
 
 
 class TripletWhaleDataset(WhaleDataset):
@@ -113,7 +129,8 @@ class TripletWhaleDataset(WhaleDataset):
         k = self._all_records.iloc[idx]['Id']
         p_k = k
         while p_k == k:
-            p_idx = random.randint(0, len(self._all_records)-1)
-            p_k = self._all_records.iloc[p_idx]['Id']
+            k_idx = random.randint(0, len(self.index_to_class)-1)
+            p_k = self.index_to_class[k_idx]
+        p_idx = random.choice(self._by_class[p_k])
         return self._all_records.iloc[p_idx]
         
