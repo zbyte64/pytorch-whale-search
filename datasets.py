@@ -97,10 +97,10 @@ class WhaleDataset(torch.utils.data.Dataset):
         img = Image.open(os.path.join(self.path, 'train', image_id)).convert("RGB")
         if flip:
             img = transforms.functional.hflip(img)
-        return np.array(img)
+        return img
 
     def process_image(self, image_id, flip):
-        im = self.read_image(image_id, flip)
+        im = np.array(self.read_image(image_id, flip))
         return self.image_t(image=im)['image']
 
 

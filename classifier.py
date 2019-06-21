@@ -74,7 +74,9 @@ class AffineClassifier(nn.Module):
         r = self.dataloader._all_records.iloc[idx]
         image_id = r['Image']
         img = self.dataloader.read_image(image_id, r['flipped'])
-        img = AUG_IMAGE_T(image=img)['image']
+        _xy = min(img.size)
+        img = img.resize((_xy, _xy))
+        img = AUG_IMAGE_T(image=np.array(img))['image']
         img = FINALIZE_T(image=img)['image'].to(p.device)
         ih,iw = img.shape[1:]
         hiw,hih = iw // 2, ih // 2
